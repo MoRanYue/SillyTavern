@@ -3093,11 +3093,28 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
         signal: signal,
     });
 
+    // Capture the x-request-id for reconnection resilience
+    const requestId = response.headers.get('x-request-id');
+
     if (!response.ok) {
         tryParseStreamingError(response, await response.text());
         throw new Error(`Got response status ${response.status}`);
     }
     if (stream) {
+        // Save the request ID so we can resume on reconnection
+        if (requestId) {
+            try {
+                const pendingData = {
+                    requestId: requestId,
+                    timestamp: Date.now(),
+                    type: type,
+                };
+                sessionStorage.setItem(`st_request_${requestId}`, JSON.stringify(pendingData));
+            } catch {
+                // sessionStorage might be full or unavailable, ignore
+            }
+        }
+
         const eventStream = getEventSourceStream();
         response.body.pipeThrough(eventStream);
         const reader = eventStream.readable.getReader();
@@ -3106,25 +3123,46 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
             const swipes = [];
             const toolCalls = [];
             const state = { reasoning: '', images: [], signature: '', toolSignatures: {} };
-            while (true) {
-                const { done, value } = await reader.read();
-                if (done) return;
-                const rawData = value.data;
-                if (rawData === '[DONE]') return;
-                tryParseStreamingError(response, rawData);
-                const parsed = JSON.parse(rawData);
+            try {
+                while (true) {
+                    const { done, value } = await reader.read();
+                    if (done) return;
+                    const rawData = value.data;
+                    if (rawData === '[DONE]') {
+                        // Clean up the pending request marker on successful completion
+                        if (requestId) {
+                            try {
+                                sessionStorage.removeItem(`st_request_${requestId}`);
+                            } catch {
+                                // ignore
+                            }
+                        }
+                        return;
+                    }
+                    tryParseStreamingError(response, rawData);
+                    const parsed = JSON.parse(rawData);
 
-                if (canMultiSwipe && Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
-                    const swipeIndex = parsed.choices[0].index - 1;
-                    // FIXME: state.reasoning should be an array to support multi-swipe
-                    swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
-                } else {
-                    text += getStreamingReply(parsed, state);
+                    if (canMultiSwipe && Array.isArray(parsed?.choices) && parsed?.choices?.[0]?.index > 0) {
+                        const swipeIndex = parsed.choices[0].index - 1;
+                        // FIXME: state.reasoning should be an array to support multi-swipe
+                        swipes[swipeIndex] = (swipes[swipeIndex] || '') + getStreamingReply(parsed, state, { overrideShowThoughts: false });
+                    } else {
+                        text += getStreamingReply(parsed, state);
+                    }
+
+                    ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
+
+                    yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
                 }
-
-                ToolManager.parseToolCalls(toolCalls, parsed, state.toolSignatures);
-
-                yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
+            } finally {
+                // Clean up on any exit (error, abort, or normal completion)
+                if (requestId) {
+                    try {
+                        sessionStorage.removeItem(`st_request_${requestId}`);
+                    } catch {
+                        // ignore
+                    }
+                }
             }
         };
     } else {

@@ -20,6 +20,7 @@ import chalk from 'chalk';
 import bytes from 'bytes';
 import { LOG_LEVELS, CHAT_COMPLETION_SOURCES, MEDIA_REQUEST_TYPE } from './constants.js';
 import { serverDirectory } from './server-directory.js';
+import { getRequestRegistry } from './request-registry.js';
 import { sync as writeFileAtomicSync } from 'write-file-atomic';
 import { isFirefox } from './express-common.js';
 
@@ -710,12 +711,75 @@ export function getImages(directoryPath, sortBy = 'name', type = MEDIA_REQUEST_T
 }
 
 /**
+ * Creates an AbortController with resilience support for reconnection.
+ * For streaming requests, the client disconnect will NOT abort the LLM request.
+ * Instead, chunks will be buffered for later retrieval.
+ * For non-streaming requests, the legacy behavior is preserved.
+ *
+ * @param {import('express').Request} request - Express request
+ * @param {import('express').Response} response - Express response
+ * @param {object} [options] - Additional options
+ * @param {boolean} [options.forceLegacy=false] - Force legacy abort-on-disconnect behavior even for streaming
+ * @returns {{ controller: AbortController, requestId: string|null, session: import('../request-registry.js').RequestSession|null }}
+ */
+export function createResilientController(request, response, options = {}) {
+    const controller = new AbortController();
+    const isStreaming = Boolean(request.body?.stream || request.body?.streaming);
+    const isLegacy = options.forceLegacy || !isStreaming;
+
+    // For streaming requests with resilience enabled, set up session tracking
+    if (isStreaming && !isLegacy) {
+        try {
+            const registry = getRequestRegistry();
+            const requestId = uuidv4();
+            const userId = request.user?.id || request.user?.profile?.handle || 'anonymous';
+            const session = registry.createSession({
+                requestId,
+                requestBody: request.body,
+                abortController: controller,
+                userId,
+            });
+
+            // Set response header so the client can capture the request ID
+            response.setHeader('x-request-id', requestId);
+
+            request.socket.removeAllListeners('close');
+            request.socket.on('close', function () {
+                session.markClientDisconnected();
+                console.debug(`Client disconnected from resilient request ${requestId}, continuing to buffer.`);
+                // Note: we do NOT call controller.abort() here
+            });
+
+            return { controller, requestId, session };
+        } catch (error) {
+            // If registry creation fails (e.g., max sessions), fall back to legacy behavior
+            console.warn('Failed to create resilient session, falling back to legacy abort-on-disconnect:', error.message);
+        }
+    }
+
+    // Legacy behavior: abort on client disconnect
+    request.socket.removeAllListeners('close');
+    request.socket.on('close', function () {
+        controller.abort();
+    });
+
+    return { controller, requestId: null, session: null };
+}
+
+/**
+ * Options for forwardFetchResponse.
+ * @typedef {object} ForwardFetchResponseOptions
+ * @property {import('../request-registry.js').RequestSession} [session] - Optional session to buffer chunks for reconnection resilience
+ */
+
+/**
  * Pipe a fetch() response to an Express.js Response, including status code.
  * @param {import('node-fetch').Response} from The Fetch API response to pipe from.
  * @param {import('express').Response} to The Express response to pipe to.
+ * @param {ForwardFetchResponseOptions} [options] - Additional options
  * @returns {Promise<void>}
  */
-export async function forwardFetchResponse(from, to) {
+export async function forwardFetchResponse(from, to, options = {}) {
     let statusCode = from.status;
     let statusText = from.statusText;
 
@@ -737,9 +801,20 @@ export async function forwardFetchResponse(from, to) {
             const detail = rawErrorText || 'Unknown error occurred';
 
             console.warn(`Streaming request failed with status ${from.status} ${statusText}: ${detail}`);
+
+            // If we have a session, mark it as failed with the error text
+            if (options.session) {
+                options.session.markFailed(rawErrorText || 'Unknown error');
+            }
+
             to.end(rawErrorText, 'utf-8');
         } catch {
             console.warn(`Streaming request failed with status ${from.status} ${statusText}: Unknown error occurred`);
+
+            if (options.session) {
+                options.session.markFailed('Unknown error');
+            }
+
             to.end();
         }
 
@@ -749,15 +824,50 @@ export async function forwardFetchResponse(from, to) {
     if (from.body && to.socket) {
         from.body.pipe(to);
 
-        to.socket.on('close', function () {
-            if (from.body instanceof Readable) from.body.destroy(); // Close the remote stream
+        // Intercept data chunks to buffer them for resilience
+        if (options.session) {
+            from.body.on('data', (chunk) => {
+                const chunkStr = chunk.toString('utf-8');
+                options.session.appendChunk(chunkStr);
+            });
+        }
 
-            to.end(); // End the Express response
+        to.socket.on('close', function () {
+            // If we have a resilience session, do NOT destroy the upstream body.
+            // The LLM request continues and chunks are buffered for later retrieval.
+            if (options.session) {
+                options.session.markClientDisconnected();
+                console.debug(`Client disconnected from request ${options.session.requestId}, continuing to buffer.`);
+                return;
+            }
+
+            // Legacy behavior: close the remote stream when client disconnects
+            if (from.body instanceof Readable) from.body.destroy();
+            to.end();
         });
 
         from.body.on('end', function () {
             console.info('Streaming request finished');
+
+            // If we have a session, mark it as complete
+            if (options.session) {
+                options.session.markComplete();
+            }
+
             to.end();
+        });
+
+        // Handle upstream errors
+        from.body.on('error', function (error) {
+            console.error('Streaming request error:', error);
+
+            if (options.session) {
+                options.session.markFailed(error);
+            }
+
+            if (!to.writableEnded) {
+                to.end();
+            }
         });
     } else {
         to.end();

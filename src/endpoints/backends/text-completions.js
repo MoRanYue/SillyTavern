@@ -13,7 +13,7 @@ import {
     FEATHERLESS_KEYS,
     OPENAI_KEYS,
 } from '../../constants.js';
-import { forwardFetchResponse, trimV1, getConfigValue } from '../../util.js';
+import { forwardFetchResponse, trimV1, getConfigValue, createResilientController } from '../../util.js';
 import { setAdditionalHeaders } from '../../additional-headers.js';
 import { createHash } from 'node:crypto';
 
@@ -281,15 +281,7 @@ router.post('/generate', async function (request, response) {
         const baseUrl = request.body.api_server;
         console.debug(request.body);
 
-        const controller = new AbortController();
-        request.socket.removeAllListeners('close');
-        request.socket.on('close', async function () {
-            if (request.body.api_type === TEXTGEN_TYPES.KOBOLDCPP && !response.writableEnded) {
-                await abortKoboldCppRequest(request, trimV1(baseUrl));
-            }
-
-            controller.abort();
-        });
+        const { controller, session } = createResilientController(request, response);
 
         let url = trimV1(baseUrl);
 
@@ -404,7 +396,7 @@ router.post('/generate', async function (request, response) {
         } else if (request.body.stream) {
             const completionsStream = await fetch(url, args);
             // Pipe remote SSE stream to Express response
-            await forwardFetchResponse(completionsStream, response);
+            await forwardFetchResponse(completionsStream, response, { session });
         } else {
             const completionsReply = await fetch(url, args);
 

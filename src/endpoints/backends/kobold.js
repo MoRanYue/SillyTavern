@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import express from 'express';
 import fetch from 'node-fetch';
 
-import { forwardFetchResponse, delay } from '../../util.js';
+import { forwardFetchResponse, delay, createResilientController } from '../../util.js';
 import { getOverrideHeaders, setAdditionalHeaders, setAdditionalHeadersByType } from '../../additional-headers.js';
 import { TEXTGEN_TYPES } from '../../constants.js';
 
@@ -16,26 +16,7 @@ router.post('/generate', async function (request, response_generate) {
     }
 
     const request_prompt = request.body.prompt;
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', async function () {
-        if (request.body.can_abort && !response_generate.writableEnded) {
-            try {
-                console.info('Aborting Kobold generation...');
-                // send abort signal to koboldcpp
-                const abortResponse = await fetch(`${request.body.api_server}/extra/abort`, {
-                    method: 'POST',
-                });
-
-                if (!abortResponse.ok) {
-                    console.error('Error sending abort request to Kobold:', abortResponse.status);
-                }
-            } catch (error) {
-                console.error(error);
-            }
-        }
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response_generate);
 
     let this_settings = {
         prompt: request_prompt,
@@ -99,7 +80,7 @@ router.post('/generate', async function (request, response_generate) {
 
             if (request.body.streaming) {
                 // Pipe remote SSE stream to Express response
-                await forwardFetchResponse(response, response_generate);
+                await forwardFetchResponse(response, response_generate, { session });
                 return;
             } else {
                 if (!response.ok) {

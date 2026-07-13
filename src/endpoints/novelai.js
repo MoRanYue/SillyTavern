@@ -5,7 +5,7 @@ import fetch from 'node-fetch';
 import express from 'express';
 
 import { readSecret, SECRET_KEYS } from './secrets.js';
-import { readAllChunks, extractFileFromZipBuffer, forwardFetchResponse } from '../util.js';
+import { readAllChunks, extractFileFromZipBuffer, forwardFetchResponse, createResilientController } from '../util.js';
 
 const API_NOVELAI = 'https://api.novelai.net';
 const TEXT_NOVELAI = 'https://text.novelai.net';
@@ -174,11 +174,7 @@ router.post('/generate', async function (req, res) {
         return res.sendStatus(400);
     }
 
-    const controller = new AbortController();
-    req.socket.removeAllListeners('close');
-    req.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(req, res);
 
     // Add customized bad words for Clio, Kayra, and Erato
     const badWordsList = getBadWordsList(req.body.model);
@@ -270,7 +266,7 @@ router.post('/generate', async function (req, res) {
 
         if (req.body.streaming) {
             // Pipe remote SSE stream to Express response
-            await forwardFetchResponse(response, res);
+            await forwardFetchResponse(response, res, { session });
         } else {
             if (!response.ok) {
                 const text = await response.text();

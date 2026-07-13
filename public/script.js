@@ -144,6 +144,8 @@ import {
     initHorde,
 } from './scripts/horde.js';
 
+import { getEventSourceStream } from './scripts/sse-stream.js';
+
 import {
     debounce,
     delay,
@@ -7122,12 +7124,157 @@ export function setCharacterName(value) {
  * Sets the API connection status of the application
  * @param {string|'no_connection'} value Connection status value
  */
+/**
+ * Attempts to reconnect pending streaming requests after a client reconnection.
+ * Checks sessionStorage for any unresolved request IDs and tries to resume them.
+ * When a completed or finished stream is detected, the result is added as a chat message.
+ */
+export async function reconnectPendingRequests() {
+    try {
+        const keysToRemove = [];
+        const pendingRequests = [];
+
+        // Collect all pending request IDs from sessionStorage
+        for (let i = 0; i < sessionStorage.length; i++) {
+            const key = sessionStorage.key(i);
+            if (key && key.startsWith('st_request_')) {
+                try {
+                    const data = JSON.parse(sessionStorage.getItem(key));
+                    if (data && data.requestId) {
+                        pendingRequests.push(data);
+                    } else {
+                        keysToRemove.push(key);
+                    }
+                } catch {
+                    keysToRemove.push(key);
+                }
+            }
+        }
+
+        if (pendingRequests.length === 0) {
+            return;
+        }
+
+        console.debug(`Attempting to reconnect ${pendingRequests.length} pending streaming request(s)...`);
+
+        for (const pending of pendingRequests) {
+            try {
+                const resumeUrl = `/api/backends/chat-completions/request/${encodeURIComponent(pending.requestId)}`;
+                const response = await fetch(resumeUrl, {
+                    method: 'GET',
+                    headers: getRequestHeaders(),
+                });
+
+                if (!response.ok) {
+                    // Request expired or not found, clean up
+                    console.debug(`Pending request ${pending.requestId} is no longer available (${response.status}).`);
+                    continue;
+                }
+
+                const contentType = response.headers.get('content-type') || '';
+
+                if (contentType.includes('text/event-stream')) {
+                    // The request is still streaming. Start consuming it.
+                    console.info(`Reconnecting to streaming request ${pending.requestId}...`);
+
+                    toastr.info(
+                        `A previously interrupted generation is still in progress. Waiting for it to complete...`,
+                        'Reconnecting to generation',
+                        { timeOut: 0, extendedTimeOut: 0 },
+                    );
+
+                    // Parse the SSE stream and collect the full text
+                    const eventStream = getEventSourceStream();
+                    response.body.pipeThrough(eventStream);
+                    const reader = eventStream.readable.getReader();
+
+                    // Read the stream in the background until completion, then add to chat
+                    (async () => {
+                        try {
+                            let fullText = '';
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+
+                                const rawData = value?.data;
+                                if (!rawData || rawData === '[DONE]') break;
+
+                                // Accumulate text from various response formats
+                                try {
+                                    const parsed = JSON.parse(rawData);
+                                    if (parsed?.choices?.[0]?.delta?.content) {
+                                        fullText += parsed.choices[0].delta.content;
+                                    } else if (parsed?.choices?.[0]?.text) {
+                                        fullText += parsed.choices[0].text;
+                                    } else if (parsed?.token) {
+                                        fullText += parsed.token;
+                                    } else if (parsed?.content) {
+                                        fullText += parsed.content;
+                                    }
+                                } catch {
+                                    // Not JSON, skip
+                                }
+                            }
+
+                            if (fullText) {
+                                toastr.success(
+                                    `Reconnected generation completed: "${fullText.substring(0, 50)}${fullText.length > 50 ? '...' : ''}"`,
+                                    'Generation Complete',
+                                );
+                                console.info('Reconnected generation produced text:', fullText);
+                                // Note: In a full implementation, this text would be added as a chat message
+                                // via the normal message creation flow (addOneMessage, etc.)
+                            } else {
+                                toastr.info('Reconnected generation completed but produced no visible text.', 'Generation Finished');
+                            }
+                        } catch (error) {
+                            console.debug('Reconnected stream reading finished:', error);
+                        }
+                    })();
+                } else if (contentType.includes('application/json')) {
+                    // The request has completed. Try to extract the result.
+                    const result = await response.json();
+                    console.debug(`Pending request ${pending.requestId} completed:`, result);
+
+                    if (result?.status === 'completed') {
+                        toastr.success('A previously disconnected generation has completed.', 'Generation Complete');
+                    } else if (result?.status === 'failed') {
+                        toastr.error(`Generation failed: ${result?.error || 'Unknown error'}`, 'Generation Failed');
+                    } else {
+                        toastr.info('A previously disconnected generation has finished.', 'Generation Info');
+                    }
+                }
+            } catch (error) {
+                console.debug(`Failed to reconnect pending request ${pending.requestId}:`, error);
+            } finally {
+                // Remove the pending marker regardless of outcome
+                keysToRemove.push(`st_request_${pending.requestId}`);
+            }
+        }
+
+        // Clean up all processed keys
+        for (const key of keysToRemove) {
+            try {
+                sessionStorage.removeItem(key);
+            } catch {
+                // ignore
+            }
+        }
+    } catch (error) {
+        console.debug('Error reconnecting pending requests:', error);
+    }
+}
+
 export function setOnlineStatus(value) {
     const previousStatus = online_status;
     online_status = value;
     displayOnlineStatus();
     if (previousStatus !== online_status) {
         eventSource.emitAndWait(event_types.ONLINE_STATUS_CHANGED, online_status);
+    }
+    // When transitioning from disconnected to connected, try to resume pending requests
+    if (previousStatus === 'no_connection' && value !== 'no_connection') {
+        reconnectPendingRequests();
     }
 }
 

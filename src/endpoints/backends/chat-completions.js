@@ -33,6 +33,7 @@ import {
     trimTrailingSlash,
     flattenSchema,
 } from '../../util.js';
+import { getRequestRegistry } from '../../request-registry.js';
 import {
     convertClaudeMessages,
     convertGooglePrompt,
@@ -208,6 +209,62 @@ function setJsonObjectFormat(bodyParams, messages, jsonSchema) {
 }
 
 /**
+ * Creates an AbortController with resilience support for reconnection.
+ * For streaming requests, the client disconnect will NOT abort the LLM request.
+ * Instead, chunks will be buffered for later retrieval.
+ * For non-streaming requests, the legacy behavior is preserved.
+ *
+ * @param {import('express').Request} request - Express request
+ * @param {import('express').Response} response - Express response
+ * @param {object} [options] - Additional options
+ * @param {boolean} [options.forceLegacy=false] - Force legacy abort-on-disconnect behavior even for streaming
+ * @returns {{ controller: AbortController, requestId: string|null, session: import('../../request-registry.js').RequestSession|null }}
+ */
+function createResilientController(request, response, options = {}) {
+    const controller = new AbortController();
+    const isStreaming = Boolean(request.body?.stream);
+    const isLegacy = options.forceLegacy || !isStreaming;
+
+    // For streaming requests with resilience enabled, set up session tracking
+    if (isStreaming && !isLegacy) {
+        try {
+            const registry = getRequestRegistry();
+            const requestId = uuidv4();
+            const userId = request.user?.id || 'anonymous';
+            const session = registry.createSession({
+                requestId,
+                requestBody: request.body,
+                abortController: controller,
+                userId,
+            });
+
+            // Set response header so the client can capture the request ID
+            response.setHeader('x-request-id', requestId);
+
+            request.socket.removeAllListeners('close');
+            request.socket.on('close', function () {
+                session.markClientDisconnected();
+                console.debug(`Client disconnected from resilient request ${requestId}, continuing to buffer.`);
+                // Note: we do NOT call controller.abort() here
+            });
+
+            return { controller, requestId, session };
+        } catch (error) {
+            // If registry creation fails (e.g., max sessions), fall back to legacy behavior
+            console.warn('Failed to create resilient session, falling back to legacy abort-on-disconnect:', error.message);
+        }
+    }
+
+    // Legacy behavior: abort on client disconnect
+    request.socket.removeAllListeners('close');
+    request.socket.on('close', function () {
+        controller.abort();
+    });
+
+    return { controller, requestId: null, session: null };
+}
+
+/**
  * Sends a request to Claude API.
  * @param {express.Request} request Express request
  * @param {express.Response} response Express response
@@ -223,11 +280,7 @@ async function sendClaudeRequest(request, response) {
     }
 
     try {
-        const controller = new AbortController();
-        request.socket.removeAllListeners('close');
-        request.socket.on('close', function () {
-            controller.abort();
-        });
+        const { controller, session } = createResilientController(request, response);
         const additionalHeaders = {};
         const betaHeaders = ['output-128k-2025-02-19', 'context-1m-2025-08-07'];
         const useTools = Array.isArray(request.body.tools) && request.body.tools.length > 0;
@@ -395,7 +448,7 @@ async function sendClaudeRequest(request, response) {
 
         if (request.body.stream) {
             // Pipe remote SSE stream to Express response
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const generateResponseText = await generateResponse.text();
@@ -635,11 +688,7 @@ async function sendMakerSuiteRequest(request, response) {
     console.debug(`${apiName} request:`, body);
 
     try {
-        const controller = new AbortController();
-        request.socket.removeAllListeners('close');
-        request.socket.on('close', function () {
-            controller.abort();
-        });
+        const { controller, session } = createResilientController(request, response);
 
         const apiVersion = getConfigValue('gemini.apiVersion', 'v1beta');
         const responseType = (stream ? 'streamGenerateContent' : 'generateContent');
@@ -705,7 +754,7 @@ async function sendMakerSuiteRequest(request, response) {
         if (stream) {
             try {
                 // Pipe remote SSE stream to Express response
-                await forwardFetchResponse(generateResponse, response);
+                await forwardFetchResponse(generateResponse, response, { session });
             } catch (error) {
                 console.error('Error forwarding streaming response:', error);
                 if (!response.headersSent) {
@@ -772,11 +821,7 @@ async function sendAI21Request(request, response) {
     }
 
     const bodyParams = {};
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response);
     // Hack to support JSON schema
     if (request.body.json_schema) {
         bodyParams.response_format = {
@@ -816,7 +861,7 @@ async function sendAI21Request(request, response) {
     try {
         const generateResponse = await fetch(API_AI21 + '/chat/completions', options);
         if (request.body.stream) {
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const errorText = await generateResponse.text();
@@ -854,11 +899,7 @@ async function sendMistralAIRequest(request, response) {
 
     try {
         const messages = convertMistralMessages(request.body.messages, getPromptNames(request));
-        const controller = new AbortController();
-        request.socket.removeAllListeners('close');
-        request.socket.on('close', function () {
-            controller.abort();
-        });
+        const { controller, session } = createResilientController(request, response);
 
         const requestBody = {
             'model': request.body.model,
@@ -906,7 +947,7 @@ async function sendMistralAIRequest(request, response) {
 
         const generateResponse = await fetch(apiUrl + '/chat/completions', config);
         if (request.body.stream) {
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const errorText = await generateResponse.text();
@@ -935,11 +976,7 @@ async function sendMistralAIRequest(request, response) {
  */
 async function sendCohereRequest(request, response) {
     const apiKey = readSecret(request.user.directories, SECRET_KEYS.COHERE, request.body.secret_id);
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response);
 
     if (!apiKey) {
         console.warn('Cohere API key is missing.');
@@ -1005,7 +1042,7 @@ async function sendCohereRequest(request, response) {
 
         if (request.body.stream) {
             const stream = await fetch(apiUrl, config);
-            await forwardFetchResponse(stream, response);
+            await forwardFetchResponse(stream, response, { session });
         } else {
             const generateResponse = await fetch(apiUrl, config);
             if (!generateResponse.ok) {
@@ -1042,11 +1079,7 @@ async function sendDeepSeekRequest(request, response) {
         return response.status(400).send({ error: true });
     }
 
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response);
 
     try {
         let bodyParams = {};
@@ -1118,7 +1151,7 @@ async function sendDeepSeekRequest(request, response) {
         const generateResponse = await fetch(apiUrl + '/chat/completions', config);
 
         if (request.body.stream) {
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const errorText = await generateResponse.text();
@@ -1154,11 +1187,7 @@ async function sendXaiRequest(request, response) {
         return response.status(400).send({ error: true });
     }
 
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response);
 
     try {
         let bodyParams = {};
@@ -1224,7 +1253,7 @@ async function sendXaiRequest(request, response) {
         const generateResponse = await fetch(apiUrl + '/chat/completions', config);
 
         if (request.body.stream) {
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const errorText = await generateResponse.text();
@@ -1260,11 +1289,7 @@ async function sendAimlapiRequest(request, response) {
         return response.status(400).send({ error: true });
     }
 
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response);
 
     try {
         let bodyParams = {};
@@ -1329,7 +1354,7 @@ async function sendAimlapiRequest(request, response) {
         const generateResponse = await fetch(apiUrl + '/chat/completions', config);
 
         if (request.body.stream) {
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const errorText = await generateResponse.text();
@@ -1365,11 +1390,7 @@ async function sendElectronHubRequest(request, response) {
         return response.status(400).send({ error: true });
     }
 
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response);
 
     try {
         let bodyParams = {};
@@ -1441,7 +1462,7 @@ async function sendElectronHubRequest(request, response) {
         const generateResponse = await fetch(apiUrl + '/chat/completions', config);
 
         if (request.body.stream) {
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const errorText = await generateResponse.text();
@@ -1477,11 +1498,7 @@ async function sendChutesRequest(request, response) {
         return response.status(400).send({ error: true });
     }
 
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response);
 
     try {
         let bodyParams = {};
@@ -1542,7 +1559,7 @@ async function sendChutesRequest(request, response) {
         const generateResponse = await fetch(apiUrl + '/chat/completions', config);
 
         if (request.body.stream) {
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const errorText = await generateResponse.text();
@@ -1579,11 +1596,7 @@ async function sendMinimaxRequest(request, response) {
         return response.status(400).send({ error: true });
     }
 
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', function () {
-        controller.abort();
-    });
+    const { controller, session } = createResilientController(request, response);
 
     try {
         // MiniMax does not allow consecutive messages with the same role.
@@ -1623,7 +1636,7 @@ async function sendMinimaxRequest(request, response) {
         const generateResponse = await fetch(apiUrl + '/chat/completions', config);
 
         if (request.body.stream) {
-            await forwardFetchResponse(generateResponse, response);
+            await forwardFetchResponse(generateResponse, response, { session });
         } else {
             if (!generateResponse.ok) {
                 const errorText = await generateResponse.text();
@@ -1697,9 +1710,7 @@ async function sendAzureOpenAIRequest(request, response) {
         ? OPENAI_FIXED_REASONING_EFFORT[request.body.model] ?? OPENAI_REASONING_EFFORT_MAP[request.body.reasoning_effort] ?? request.body.reasoning_effort
         : undefined;
 
-    const controller = new AbortController();
-    request.socket.removeAllListeners('close');
-    request.socket.on('close', () => controller.abort());
+    const { controller, session } = createResilientController(request, response);
 
     const config = {
         method: 'POST',
@@ -1717,7 +1728,7 @@ async function sendAzureOpenAIRequest(request, response) {
         const fetchResponse = await fetch(endpointUrl, config);
 
         if (request.body.stream) {
-            return await forwardFetchResponse(fetchResponse, response);
+            return await forwardFetchResponse(fetchResponse, response, { session });
         }
 
         if (fetchResponse.ok) {
@@ -2545,11 +2556,7 @@ router.post('/generate', async function (request, response) {
             `${apiUrl}/completions` :
             `${apiUrl}/chat/completions`;
 
-        const controller = new AbortController();
-        request.socket.removeAllListeners('close');
-        request.socket.on('close', function () {
-            controller.abort();
-        });
+        const { controller, session } = createResilientController(request, response);
 
         if (!isTextCompletion && Array.isArray(request.body.tools) && request.body.tools.length > 0) {
             bodyParams['tools'] = request.body.tools;
@@ -2608,7 +2615,7 @@ router.post('/generate', async function (request, response) {
 
         if (request.body.stream) {
             console.info('Streaming request in progress');
-            return await forwardFetchResponse(fetchResponse, response);
+            return await forwardFetchResponse(fetchResponse, response, { session });
         }
 
         if (fetchResponse.ok) {
@@ -2909,5 +2916,167 @@ router.post('/process', async function (request, response) {
     } catch (error) {
         console.error(error);
         return response.sendStatus(500);
+    }
+});
+
+/**
+ * GET /request/:requestId - Resume a streaming response after reconnection.
+ * Returns buffered events and continues streaming if still active.
+ */
+router.get('/request/:requestId', async (request, response) => {
+    try {
+        const { requestId } = request.params;
+        const registry = getRequestRegistry();
+        const session = registry.getSession(requestId);
+
+        if (!session) {
+            return response.status(404).send({ error: 'Request not found. It may have expired or been completed.' });
+        }
+
+        // Verify user identity
+        const userId = request.user?.id || 'anonymous';
+        if (session.userId !== userId) {
+            return response.status(403).send({ error: 'Forbidden' });
+        }
+
+        // If session was aborted by user, return error
+        if (session.status === 'aborted') {
+            return response.status(499).send({ error: 'Request was aborted by the user.' });
+        }
+
+        // If completed, return final data as JSON
+        if (session.status === 'completed') {
+            response.json({
+                status: 'completed',
+                requestId: session.requestId,
+                data: session.finalData,
+            });
+            return;
+        }
+
+        // If failed, return error
+        if (session.status === 'failed') {
+            response.status(500).send({
+                status: 'failed',
+                requestId: session.requestId,
+                error: session.error?.message || String(session.error),
+            });
+            return;
+        }
+
+        // Streaming in progress: set up SSE response
+        response.setHeader('Content-Type', 'text/event-stream');
+        response.setHeader('Cache-Control', 'no-cache');
+        response.setHeader('Connection', 'keep-alive');
+        response.setHeader('x-request-id', requestId);
+
+        // Send all buffered events immediately
+        const bufferedEvents = session.getBufferedEvents();
+        for (const event of bufferedEvents) {
+            response.write(event);
+        }
+
+        console.debug(`Reconnected client for request ${requestId}, sent ${bufferedEvents.length} buffered events.`);
+
+        // Set up listeners for new events
+        const onChunk = (chunkStr) => {
+            response.write(chunkStr);
+        };
+
+        const onComplete = () => {
+            response.write('data: [DONE]\n\n');
+            response.end();
+        };
+
+        const onError = (error) => {
+            const errorMessage = error?.message || String(error || 'Unknown error');
+            response.write(`data: ${JSON.stringify({ error: errorMessage })}\n\n`);
+            response.end();
+        };
+
+        const onAborted = () => {
+            response.end();
+        };
+
+        session.on('chunk', onChunk);
+        session.on('complete', onComplete);
+        session.on('error', onError);
+        session.on('aborted', onAborted);
+
+        // Clean up listeners when client disconnects again
+        response.on('close', () => {
+            session.off('chunk', onChunk);
+            session.off('complete', onComplete);
+            session.off('error', onError);
+            session.off('aborted', onAborted);
+
+            if (session.status === 'streaming') {
+                session.markClientDisconnected();
+                // Still do NOT abort the LLM request
+            }
+        });
+    } catch (error) {
+        console.error('Error in request reconnection endpoint:', error);
+        if (!response.headersSent) {
+            response.status(500).send({ error: 'Internal server error' });
+        }
+    }
+});
+
+/**
+ * POST /request/:requestId/abort - Abort a generation request (user-initiated stop).
+ */
+router.post('/request/:requestId/abort', async (request, response) => {
+    try {
+        const { requestId } = request.params;
+        const registry = getRequestRegistry();
+        const session = registry.getSession(requestId);
+
+        if (!session) {
+            return response.status(404).send({ error: 'Request not found.' });
+        }
+
+        // Verify user identity
+        const userId = request.user?.id || 'anonymous';
+        if (session.userId !== userId) {
+            return response.status(403).send({ error: 'Forbidden' });
+        }
+
+        session.abort();
+        console.debug(`User aborted request ${requestId}.`);
+
+        return response.send({ status: 'aborted', requestId });
+    } catch (error) {
+        console.error('Error aborting request:', error);
+        return response.status(500).send({ error: 'Internal server error' });
+    }
+});
+
+/**
+ * GET /active - List all active requests for the current user.
+ */
+router.get('/active', async (request, response) => {
+    try {
+        const userId = request.user?.id || 'anonymous';
+        const registry = getRequestRegistry();
+
+        /** @type {Array<{requestId: string, status: string, createdAt: number, lastActiveAt: number}>} */
+        const activeRequests = [];
+
+        for (const [id, session] of registry.sessions) {
+            if (session.userId === userId) {
+                activeRequests.push({
+                    requestId: id,
+                    status: session.status,
+                    createdAt: session.createdAt,
+                    lastActiveAt: session.lastActiveAt,
+                });
+            }
+        }
+
+        return response.send({ requests: activeRequests });
+    } catch (error) {
+        console.error('Error listing active requests:', error);
+        return response.status(500).send({ error: 'Internal server error' });
     }
 });
