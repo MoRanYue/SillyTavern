@@ -791,6 +791,20 @@ async function firstLoadInit() {
     await eventSource.emit(event_types.APP_READY);
 }
 
+// Listen for browser online/offline events to trigger reconnection resilience
+window.addEventListener('online', () => {
+    console.debug('Browser detected network recovery. Attempting to reconnect pending requests...');
+    reconnectPendingRequests();
+    // Also trigger a status check to update the connection indicator
+    if (typeof resultCheckStatus === 'function') {
+        resultCheckStatus();
+    }
+});
+
+window.addEventListener('offline', () => {
+    console.debug('Browser detected network loss.');
+});
+
 async function fixViewport() {
     document.body.style.position = 'absolute';
     await delay(1);
