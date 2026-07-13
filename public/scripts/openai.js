@@ -3126,10 +3126,14 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
             try {
                 while (true) {
                     const { done, value } = await reader.read();
-                    if (done) return;
+                    if (done) {
+                        // Stream ended, but no [DONE] event was received.
+                        // This could be a network error. Keep the requestId for potential reconnection.
+                        return;
+                    }
                     const rawData = value.data;
                     if (rawData === '[DONE]') {
-                        // Clean up the pending request marker on successful completion
+                        // Clean up the pending request marker on successful completion only
                         if (requestId) {
                             try {
                                 sessionStorage.removeItem(`st_request_${requestId}`);
@@ -3154,15 +3158,13 @@ async function sendOpenAIRequest(type, messages, signal, { jsonSchema = null } =
 
                     yield { text, swipes: swipes, logprobs: parseChatCompletionLogprobs(parsed), toolCalls: toolCalls, state: state };
                 }
-            } finally {
-                // Clean up on any exit (error, abort, or normal completion)
-                if (requestId) {
-                    try {
-                        sessionStorage.removeItem(`st_request_${requestId}`);
-                    } catch {
-                        // ignore
-                    }
-                }
+            } catch (error) {
+                // Network error or abort - do NOT clean up the requestId.
+                // The request ID stays in sessionStorage so reconnectPendingRequests can find it.
+                // On user-initiated stop, the stopGeneration function handles server-side abort.
+                console.debug('Stream reading error, keeping requestId for potential reconnection:', error?.message);
+                // Re-throw so the caller knows the stream failed
+                throw error;
             }
         };
     } else {
