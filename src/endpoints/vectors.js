@@ -290,6 +290,14 @@ function getModelScope(sourceSettings) {
 }
 
 /**
+ * Cache for LocalIndex instances to avoid repeated disk reads and JSON parsing.
+ * Key: path to the index folder. Value: LocalIndex instance.
+ * Instances are reused across requests within the same process lifetime.
+ * @type {Map<string, vectra.LocalIndex>}
+ */
+const indexCache = new Map();
+
+/**
  * Gets the index for the vector collection
  * @param {import('../users.js').UserDirectoryList} directories - User directories
  * @param {string} collectionId - The collection ID
@@ -300,12 +308,19 @@ function getModelScope(sourceSettings) {
 async function getIndex(directories, collectionId, source, sourceSettings) {
     const model = getModelScope(sourceSettings);
     const pathToFile = path.join(directories.vectors, sanitize(source), sanitize(collectionId), sanitize(model));
+
+    // Return cached instance to avoid expensive re-read and re-parse of index.json
+    if (indexCache.has(pathToFile)) {
+        return indexCache.get(pathToFile);
+    }
+
     const store = new vectra.LocalIndex(pathToFile);
 
     if (!await store.isIndexCreated()) {
         await store.createIndex();
     }
 
+    indexCache.set(pathToFile, store);
     return store;
 }
 
@@ -406,13 +421,13 @@ async function queryCollection(directories, collectionId, source, sourceSettings
  */
 async function multiQueryCollection(directories, collectionIds, source, sourceSettings, searchText, topK, threshold) {
     const vector = await getVector(source, sourceSettings, searchText, true, directories);
-    const results = [];
 
-    for (const collectionId of collectionIds) {
+    // Query all collections in parallel to reduce total latency
+    const results = (await Promise.all(collectionIds.map(async (collectionId) => {
         const store = await getIndex(directories, collectionId, source, sourceSettings);
         const result = await store.queryItems(vector, topK);
-        results.push(...result.map(result => ({ collectionId, result })));
-    }
+        return result.map(r => ({ collectionId, result: r }));
+    }))).flat();
 
     // Sort results by descending similarity, apply threshold, and take top K
     const sortedResults = results
